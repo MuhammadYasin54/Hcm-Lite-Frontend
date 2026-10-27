@@ -1,10 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { ApiError, apiRequest, downloadApiFile } from "@/lib/api";
 import { moduleDefinitions, organizationSections } from "@/lib/modules";
 import FaceAttendanceCheckIn from "@/components/workspace/FaceAttendanceCheckIn";
+import SweetAlert from "@/components/auth/SweetAlert";
+import ReviewDecisionDialog from "@/components/workspace/ReviewDecisionDialog";
 
 function unwrapRows(result) {
   if (Array.isArray(result)) return result;
@@ -35,6 +37,12 @@ function currentLocalDate() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 }
+
+const assistantPrompts = {
+  admin: ["What are practical priorities for growing a business?", "What should a fair salary increase policy include?", "How can we reduce employee turnover?"],
+  hr: ["What should our salary increase policy include?", "How can we make performance reviews fair?", "What helps improve employee retention?"],
+  employee: ["How many leaves are pending?", "What is my attendance this month?", "How many late arrivals this month?", "Show my current payslip"],
+};
 
 function FormFields({ fields, values, onChange, disabled, referenceData = {} }) {
   return fields.map((field) => (
@@ -94,6 +102,7 @@ export default function WorkspaceModulePage() {
   const [employeePage, setEmployeePage] = useState(1);
   const [chatInput, setChatInput] = useState("");
   const [chat, setChat] = useState([]);
+  const chatEndRef = useRef(null);
   const [smartPrompt, setSmartPrompt] = useState("");
   const [smartLoading, setSmartLoading] = useState(false);
   const [smartSuggestion, setSmartSuggestion] = useState(null);
@@ -108,6 +117,10 @@ export default function WorkspaceModulePage() {
   const [attendanceDate, setAttendanceDate] = useState(currentLocalDate);
   const [attendanceMonth, setAttendanceMonth] = useState(() => currentLocalDate().slice(0, 7));
   const [showCameraCheckIn, setShowCameraCheckIn] = useState(false);
+  const [leaveToCancel, setLeaveToCancel] = useState(null);
+  const [reviewTarget, setReviewTarget] = useState(null);
+  const [reviewComment, setReviewComment] = useState("");
+  const [reviewError, setReviewError] = useState("");
 
   const listEndpoint = useMemo(() => {
     if (!definition) return "";
@@ -197,6 +210,10 @@ export default function WorkspaceModulePage() {
     setEmployeePage(1); setQuery(""); setAppliedQuery(""); setChat([]); setSmartSuggestion(null);
   }, [role, section]);
 
+  useEffect(() => {
+    if (chat.length) chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [busy, chat]);
+
   function setField(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
   }
@@ -281,15 +298,13 @@ export default function WorkspaceModulePage() {
       setNotice("Record edit mode mein hai.");
       return;
     } else if (definition.kind === "leave-hr" || definition.kind === "attendance-hr") {
-      const comment = window.prompt("Decision ke saath comment likhein:");
-      if (!comment?.trim()) return;
-      const decision = window.confirm("Select OK to approve this request or Cancel to reject it.") ? "approved" : "rejected";
-      path = definition.kind === "leave-hr" ? `/leave/requests/${encodeURIComponent(id)}/decision` : `/attendance/corrections/${encodeURIComponent(id)}`;
-      body = definition.kind === "leave-hr" ? { status: decision, comment: comment.trim() } : { decision, comment: comment.trim() };
+      setReviewTarget({ ...row, id, reviewKind: definition.kind });
+      setReviewComment("");
+      setReviewError("");
+      return;
     } else if (definition.kind === "leave-employee") {
-      if (!window.confirm("Cancel this leave request?")) return;
-      path = `/leave/requests/${encodeURIComponent(id)}/cancel`;
-      body = {};
+      setLeaveToCancel(id);
+      return;
     } else if (definition.kind === "payroll-admin") {
       if (!window.confirm("Finalize this payroll run? A finalized run cannot be edited.")) return;
       path = `/payroll/runs/${encodeURIComponent(id)}/finalize`;
@@ -327,6 +342,42 @@ export default function WorkspaceModulePage() {
       await load();
     } catch (error) {
       setNotice(error instanceof ApiError ? error.message : "Unable to complete this action.");
+    } finally { setBusy(false); }
+  }
+
+  async function submitReviewDecision(decision) {
+    if (!reviewTarget) return;
+    const comment = reviewComment.trim();
+    if (!comment) { setReviewError("Please add a comment before approving or rejecting."); return; }
+    const isLeave = reviewTarget.reviewKind === "leave-hr";
+    const path = isLeave
+      ? `/leave/requests/${encodeURIComponent(reviewTarget.id)}/decision`
+      : `/attendance/corrections/${encodeURIComponent(reviewTarget.id)}`;
+    const body = isLeave ? { status: decision, comment } : { decision, comment };
+    setBusy(true);
+    setReviewError("");
+    setNotice("");
+    try {
+      await apiRequest(path, { method: "PATCH", body: JSON.stringify(body) });
+      setReviewTarget(null);
+      setReviewComment("");
+      setNotice(decision === "approved" ? "Request approved successfully." : "Request rejected successfully.");
+      await load();
+    } catch (error) {
+      setReviewError(error instanceof ApiError ? error.message : "Unable to save this review decision.");
+    } finally { setBusy(false); }
+  }
+
+  async function confirmCancelLeave() {
+    if (!leaveToCancel) return;
+    setBusy(true);
+    setLeaveToCancel(null);
+    try {
+      await apiRequest(`/leave/requests/${encodeURIComponent(leaveToCancel)}/cancel`, { method: "POST", body: JSON.stringify({}) });
+      setNotice("Leave request cancelled successfully.");
+      await load();
+    } catch (error) {
+      setNotice(error instanceof ApiError ? error.message : "Unable to cancel this leave request.");
     } finally { setBusy(false); }
   }
 
@@ -396,7 +447,7 @@ export default function WorkspaceModulePage() {
     try {
       const answer = await apiRequest(definition.endpoint, { method: "POST", body: JSON.stringify({ message: text }) });
       const reply = answer?.answer || answer?.message || answer?.response;
-      setChat((items) => [...items, { role: "assistant", text: reply || "The assistant did not return a response. Please try again." }]);
+      setChat((items) => [...items, { role: answer?.available === false ? "error" : "assistant", text: reply || "The assistant did not return a response. Please try again." }]);
     } catch (error) {
       setChat((items) => [...items, { role: "error", text: error instanceof ApiError ? error.message : "Unable to reach the AI assistant." }]);
     } finally { setBusy(false); }
@@ -439,9 +490,11 @@ export default function WorkspaceModulePage() {
 
   return (
     <section className="workspace-page">
+      <SweetAlert icon="warning" title={leaveToCancel ? "Cancel leave request?" : ""} text="This leave request will be cancelled." confirmText="Yes, cancel it" cancelText="Keep request" onConfirm={confirmCancelLeave} onCancel={() => setLeaveToCancel(null)} />
+      <ReviewDecisionDialog request={reviewTarget} comment={reviewComment} onCommentChange={(value) => { setReviewComment(value); setReviewError(""); }} onClose={() => { if (!busy) { setReviewTarget(null); setReviewError(""); } }} onDecision={submitReviewDecision} busy={busy} error={reviewError} />
       <div className="workspace-page-heading">
-        <div><div className="workspace-eyebrow">{role} workspace</div><h1>{definition.title}</h1><p>{definition.description}</p></div>
-        <button className="workspace-refresh" type="button" onClick={load} disabled={pageState.status === "loading"}><span aria-hidden="true">↻</span> Refresh</button>
+        <div className="workspace-heading-copy"><div className="workspace-eyebrow">{role} workspace</div><h1>{definition.title}</h1><p>{definition.description}</p></div>
+        <button className="workspace-refresh" type="button" onClick={load} disabled={pageState.status === "loading"}><span className={pageState.status === "loading" ? "refresh-spinner" : ""} aria-hidden="true">↻</span> {pageState.status === "loading" ? "Refreshing…" : "Refresh"}</button>
       </div>
 
       {section.startsWith("organization/") ? <nav className="module-subnav" aria-label="Organization sections">{organizationSections.map(([key, label]) => <a className={section === `organization/${key}` ? "module-subnav-active" : ""} href={`/admin/organization/${key}`} key={key}>{label}</a>)}</nav> : null}
@@ -452,11 +505,12 @@ export default function WorkspaceModulePage() {
       {temporaryCredential ? <div className="module-notice" role="alert"><strong>Temporary password (shown once):</strong> <code>{temporaryCredential.password}</code>{temporaryCredential.login ? <span> · Login: {temporaryCredential.login}</span> : null}<button className="module-secondary-action" type="button" onClick={async () => { await navigator.clipboard.writeText(temporaryCredential.password); setNotice("Temporary password copied to the clipboard."); }}>Copy password</button><button className="module-secondary-action" type="button" onClick={() => setTemporaryCredential(null)}>Hide</button><p>Share this password securely. The employee must change it at first sign-in.</p></div> : null}
 
       {definition.kind === "assistant" && pageState.status === "ready" ? (
-        <div className="assistant-panel">
-          <div className="assistant-empty"><span>✦</span><h2>What can I help you with?</h2><p>Responses use only records you are authorized to access and your company policies.</p></div>
-          {role === "employee" ? <div className="assistant-quick-prompts" aria-label="Common employee questions">{["How many leaves are pending?", "What is my attendance this month?", "How many late arrivals this month?", "Show my current payslip"].map((question) => <button key={question} type="button" className="module-secondary-action" onClick={() => sendChat(question)} disabled={busy}>{question}</button>)}</div> : null}
-          {chat.length ? <div className="assistant-messages" aria-live="polite">{chat.map((item, index) => <div className={`assistant-message assistant-${item.role}`} key={`${index}-${item.text}`}><span>{item.role === "user" ? "You" : item.role === "assistant" ? "AI-generated" : "Notice"}</span><p>{item.text}</p></div>)}</div> : null}
-          <form className="assistant-compose" onSubmit={sendChat}><textarea aria-label="Enter your question" rows={2} value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder="Enter your question…" disabled={busy} /><button type="submit" className="primary-button" disabled={busy || !chatInput.trim()}>{busy ? "Thinking…" : "Send →"}</button></form>
+        <div className={`assistant-panel${chat.length ? " assistant-panel-active" : ""}`}>
+          {!chat.length ? <>
+            <div className="assistant-welcome-card"><div className="assistant-welcome-icon" aria-hidden="true">✦</div><div><span className="assistant-welcome-kicker">HCM LITE · AI ASSISTANT</span><h2>{role === "employee" ? "Your work assistant" : "Your business and HR assistant"}</h2><p>{role === "employee" ? "Ask about your attendance, leave, or payslip." : "Ask about business operations, HR practices, workplace policies, or company records."}</p></div></div>
+            {assistantPrompts[role] ? <div className="assistant-quick-prompts" aria-label="Suggested questions">{assistantPrompts[role].map((question) => <button key={question} type="button" className="assistant-prompt-chip" onClick={() => sendChat(question)} disabled={busy}><span aria-hidden="true">✦</span>{question}<span className="assistant-prompt-arrow" aria-hidden="true">↗</span></button>)}</div> : null}
+          </> : <div className="assistant-messages" aria-live="polite">{chat.map((item, index) => <div className={`assistant-message assistant-${item.role}`} key={`${index}-${item.text}`}><span>{item.role === "user" ? "You" : item.role === "assistant" ? "HCM assistant" : "Assistant notice"}</span><p>{item.text}</p></div>)}{busy ? <div className="assistant-message assistant-thinking"><span>HCM assistant</span><p><i className="assistant-thinking-spinner" aria-hidden="true" /> Thinking through your question…</p></div> : null}<div ref={chatEndRef} /></div>}
+          <form className="assistant-compose" onSubmit={sendChat}><textarea aria-label="Enter your question" rows={2} value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder={role === "employee" ? "Ask about your work…" : "Ask about your business or HR…"} disabled={busy} /><button type="submit" className="primary-button" disabled={busy || !chatInput.trim()}>{busy ? "Thinking…" : <>Send <span aria-hidden="true">↗</span></>}</button></form>
         </div>
       ) : null}
 
@@ -487,9 +541,9 @@ export default function WorkspaceModulePage() {
 
       {definition.fields?.length && pageState.status === "ready" ? (
         <form className="module-form-card" onSubmit={submitForm}>
-          <div className="module-card-heading"><div><h2>{definition.kind === "settings" || definition.kind === "profile" ? "Edit details" : editingId ? `Edit ${definition.title.toLowerCase().replace(/s$/, "")}` : definition.kind === "payroll-hr" ? "Create monthly draft" : `Add ${definition.title.toLowerCase().replace(/s$/, "")}`}</h2><p>Required checks aur business rules backend par apply honge.</p></div>{definition.kind === "settings" && role === "admin" ? <button type="button" className="module-secondary-action" onClick={useCurrentOfficeLocation} disabled={busy}>Use this device location</button> : null}{editingId ? <button type="button" className="module-secondary-action" onClick={() => { setEditingId(null); setForm({}); }}>Cancel edit</button> : null}</div>
+          <div className="module-card-heading"><div><h2>{definition.kind === "settings" || definition.kind === "profile" ? "Edit details" : editingId ? `Edit ${definition.title.toLowerCase().replace(/s$/, "")}` : definition.kind === "payroll-hr" ? "Create monthly draft" : `Add ${definition.title.toLowerCase().replace(/s$/, "")}`}</h2></div>{definition.kind === "settings" && role === "admin" ? <button type="button" className="module-secondary-action" onClick={useCurrentOfficeLocation} disabled={busy}>Use this device location</button> : null}{editingId ? <button type="button" className="module-secondary-action" onClick={() => { setEditingId(null); setForm({}); }}>Cancel edit</button> : null}</div>
           <div className="module-form-grid"><FormFields fields={definition.fields} values={form} onChange={setField} disabled={busy} referenceData={referenceData} /></div>
-          <div className="module-form-actions"><button type="submit" className="primary-button" disabled={busy}>{busy ? "Saving…" : editingId || definition.method === "PATCH" ? "Save changes" : "Save"}</button>{definition.kind === "payroll-hr" ? <span className="module-helper">Payroll run HR draft ke taur par banega; finalization Admin karega.</span> : null}</div>
+          <div className="module-form-actions"><button type="submit" className="primary-button" disabled={busy}>{busy ? "Saving…" : editingId || definition.method === "PATCH" ? "Save changes" : "Save"}</button>{definition.kind === "payroll-hr" ? <span className="module-helper">It will be finalized by Admin.</span> : null}</div>
         </form>
       ) : null}
 
@@ -502,14 +556,14 @@ export default function WorkspaceModulePage() {
         <div className="module-form-actions"><button className="primary-button" type="submit" disabled={busy}>{busy ? "Saving…" : "Save salary structure"}</button></div>
       </form> : null}
 
-      {definition.kind === "payroll-admin" && pageState.status === "ready" ? <p className="module-helper module-lock-note">Finalize karne se pehle confirmation li jayegi. Finalized payroll lock ho jata hai.</p> : null}
+      {definition.kind === "payroll-admin" && pageState.status === "ready" ? <p className="module-helper module-lock-note">Confirmation will be taken before finalization, after finalization payroll will be locked.</p> : null}
 
       {definition.kind === "employees" && employeeDetail ? <section className="module-data-card employee-detail-panel"><div className="module-card-heading"><div><h2>Employee 360</h2><p>{displayValue(employeeDetail.firstName)} {displayValue(employeeDetail.lastName)} · {displayValue(employeeDetail.email)}</p></div><button className="module-secondary-action" type="button" onClick={() => setEmployeeDetail(null)}>Close</button></div>
         {role === "hr" ? <form onSubmit={saveEmployeeEdit}><div className="module-form-grid"><FormFields fields={moduleDefinitions.hr.employees.editFields} values={employeeEdit} onChange={(name, value) => setEmployeeEdit((current) => ({ ...current, [name]: value }))} disabled={busy} referenceData={referenceData} /></div><div className="module-form-actions"><button className="primary-button" type="submit" disabled={busy}>{busy ? "Saving…" : "Save employee changes"}</button></div></form> : <dl className="employee-detail-grid">{Object.entries(employeeDetail).filter(([key]) => !["_id", "__v", "password", "updatedAt"].includes(key)).map(([key, value]) => <div key={key}><dt>{columnLabel(key)}</dt><dd>{displayValue(value)}</dd></div>)}</dl>}
       </section> : null}
 
       {pageState.status === "ready" && !["assistant", "analytics", "settings", "profile"].includes(definition.kind) ? (
-        <section className="module-data-card"><div className="module-card-heading"><div><h2>{definition.kind === "attendance-employee" ? "My attendance records" : definition.kind === "leave-employee" ? "My leave requests" : "Records"}</h2><p>{rows.length ? `${rows.length} server record${rows.length === 1 ? "" : "s"}` : "Data server se load hota hai."}</p></div></div>
+        <section className="module-data-card"><div className="module-card-heading"><div><h2>{definition.kind === "attendance-employee" ? "My attendance records" : definition.kind === "leave-employee" ? "My leave requests" : "Records"}</h2><p>{rows.length ? `${rows.length} server record${rows.length === 1 ? "" : "s"}` : ""}</p></div></div>
           {rows.length ? <ModuleTable rows={rows} columns={definition.columns} actionLabel={mainActionLabel} onAction={rowAction} disabled={busy} canAct={canAct} /> : <div className="module-empty"><span aria-hidden="true">◌</span><h3>No records yet</h3><p>Records will appear here when data is available in this module.</p></div>}
           {definition.search && pageState.meta ? <div className="module-pagination"><span>{pageState.meta.total ?? rows.length} employees · Page {pageState.meta.page || employeePage}</span><div><button type="button" onClick={() => setEmployeePage((current) => Math.max(1, current - 1))} disabled={(pageState.meta.page || employeePage) <= 1 || pageState.status !== "ready"}>Previous</button><button type="button" onClick={() => setEmployeePage((current) => current + 1)} disabled={(pageState.meta.page || employeePage) * (pageState.meta.pageSize || 20) >= (pageState.meta.total || 0) || pageState.status !== "ready"}>Next</button></div></div> : null}
           {["attendance-hr", "attendance-employee"].includes(definition.kind) ? <div className="module-secondary-table"><div className="module-card-heading"><div><h2>Correction requests</h2><p>Requests and their statuses are loaded from the server.</p></div></div>{pageState.result?.corrections?.length ? <ModuleTable rows={pageState.result.corrections} columns={["employeeName", "date", "requestedCheckIn", "requestedCheckOut", "reason", "status"]} actionLabel={definition.kind === "attendance-hr" ? "Review" : ""} onAction={rowAction} disabled={busy} canAct={canAct} /> : <div className="module-empty"><h3>No pending corrections</h3><p>New requests will appear here.</p></div>}</div> : null}

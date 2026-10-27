@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import AuthLayout, { FormAlert, FormField, SubmitButton } from "@/components/auth/AuthLayout";
+import SweetAlert from "@/components/auth/SweetAlert";
 import { authApi, ApiError } from "@/lib/api";
 
 const roleHomes = {
@@ -19,6 +20,9 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [selectedRole, setSelectedRole] = useState("employee");
+  const [loginSuccess, setLoginSuccess] = useState(false);
+  const [nextPath, setNextPath] = useState("");
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -29,12 +33,18 @@ export default function LoginPage() {
       const result = await authApi.login({ email: email.trim(), password });
       const user = result?.user ?? result;
       const role = String(user?.role || "").toLowerCase();
+      if (role !== selectedRole) {
+        setMessage(`This account is not registered as ${selectedRole === "hr" ? "an HR" : `an ${selectedRole}`} account.`);
+        return;
+      }
       if (!roleHomes[role]) {
         setMessage("The server returned an unrecognized account role. Contact your administrator.");
         return;
       }
-      router.replace(user.mustChangePassword ? "/change-password" : roleHomes[role]);
-      router.refresh();
+      setNextPath(user.mustChangePassword ? "/change-password" : roleHomes[role]);
+      setLoginSuccess(true);
+      setEmail("");
+      setPassword("");
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : "Sign-in failed. Please try again.");
     } finally {
@@ -44,9 +54,16 @@ export default function LoginPage() {
 
   return (
     <AuthLayout>
+      <SweetAlert icon="success" title={loginSuccess ? "Login successful" : ""} text="Welcome back to your workspace." onConfirm={() => { setLoginSuccess(false); router.replace(nextPath); router.refresh(); }} />
       <div className="eyebrow auth-eyebrow">Welcome to your workspace</div>
       <h2 className="auth-heading">Sign in to HCM Lite</h2>
       <p className="auth-subheading">Sign in with your work account. Your access is based on your assigned role.</p>
+
+      <div className="login-role-picker" role="group" aria-label="Choose account type">
+        {[ ["employee", "Employee"], ["hr", "HR"], ["admin", "Admin"] ].map(([role, label]) => (
+          <button key={role} type="button" className={`login-role-option${selectedRole === role ? " login-role-selected" : ""}`} onClick={() => { setSelectedRole(role); setMessage(""); }} aria-pressed={selectedRole === role}>{label}</button>
+        ))}
+      </div>
 
       <form className="auth-form" onSubmit={handleSubmit}>
         <FormAlert message={message} />
@@ -57,7 +74,7 @@ export default function LoginPage() {
           value={email}
           onChange={(event) => setEmail(event.target.value)}
           placeholder="you@company.com"
-          autoComplete="username"
+          autoComplete="off"
           disabled={busy}
           inputMode="email"
         />
@@ -74,7 +91,7 @@ export default function LoginPage() {
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               placeholder="Enter your password"
-              autoComplete="current-password"
+              autoComplete="new-password"
               required
               disabled={busy}
             />
